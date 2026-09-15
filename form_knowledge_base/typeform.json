@@ -1,0 +1,30 @@
+{
+  "platform_id": "typeform",
+  "name": "Typeform",
+  "url_patterns": [
+    "[a-z0-9-]+\\.typeform\\.com/to/",
+    "typeform\\.com/to/"
+  ],
+  "navigation": {
+    "type": "conversational",
+    "step_delay_ms": 600,
+    "next_button_selector": "button[data-qa='ok-button-visible'], button[data-qa='ok-button']"
+  },
+  "selectors": {
+    "item_selector": "[data-qa='block-wrapper'][data-qa-active='true'], [data-qa='block-wrapper'], div[data-qa-block]",
+    "question_selector": "[data-qa='block-title'], h1, h2, span[data-qa='title'], [data-qa='question-title']",
+    "short_text_selector": "input[type='text'], input[type='email'], input[type='tel'], input[type='url'], input[type='number']",
+    "paragraph_selector": "textarea",
+    "radio_selector": "div[data-qa='choice'], [data-qa='choice-label'], [role='radio']",
+    "checkbox_selector": "div[data-qa='choice'], [data-qa='choice-label'], [role='checkbox']",
+    "dropdown_selector": "div[data-qa='dropdown'], [role='combobox'], select",
+    "dropdown_options_selector": "div[data-qa='dropdown-item'], [role='option'], option",
+    "required_selector": "span[data-qa='required-asterisk'], span:has-text('*')",
+    "submit_selector": "button[data-qa='submit-button'], button:has-text('Submit')",
+    "confirmation_selector": "[data-qa='thank-you-screen'], .thank-you-screen, [data-qa='ending-screen'], div:has-text('All done')"
+  },
+  "quirks": [
+    "Conversational format presents one active question at a time.",
+    "After filling a question, trigger either the OK button or keyboard Enter to transition to the next block."
+  ]
+}

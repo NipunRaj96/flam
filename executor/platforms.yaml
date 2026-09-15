@@ -1,0 +1,48 @@
+# Per-platform structural fingerprints.
+# Adding a new platform = adding a new top-level key here, NOT new Python code.
+# See doc 03 for the rationale.
+
+google_forms:
+  # URL patterns used by the classifier (regex)
+  url_patterns:
+    - "docs\\.google\\.com/forms"
+    - "forms\\.gle/"
+
+  # Container for each question block
+  # NOTE: .freebirdFormviewerViewItemsItemItem is the old class (pre-2024).
+  # Current Google Forms uses [role='listitem'] — confirmed against live DOM.
+  item_selector: "[role='listitem']"
+
+  # Question title within a block.
+  # [role='heading'] is stable across Google Forms versions.
+  question_selector: "[role='heading']"
+
+  # Input type selectors (scoped within each item block)
+  short_text_selector: "input[type='text'], input[type='email'], input[type='tel'], input[type='url'], input[type='number']"
+  paragraph_selector: "textarea"
+  radio_selector: "[role='radio']"
+  checkbox_selector: "[role='checkbox']"
+  dropdown_selector: "[role='listbox'], select"
+  dropdown_options_selector: "[role='option'], option"
+
+  # Required-field marker (the asterisk label)
+  required_selector: "[aria-label*='required'], [aria-required='true']"
+
+  # Submit button — [role='button'] with text "Submit" is stable.
+  # We'll match by role + text, not a brittle class name.
+  submit_selector: "[role='button']:has-text('Submit')"
+
+  # Post-submit confirmation — the "Your response has been recorded" element.
+  confirmation_selector: ".freebirdFormviewerViewResponseConfirmationMessage, [data-is-touch-wrapper='true'] .vHW8K, .vHW8K"
+
+  # Known quirks:
+  # - Google Forms re-renders question IDs per session; match by text/role, not ID.
+  # - Short URL (forms.gle) redirects to docs.google.com — handled by resolve_canonical_url.
+  # - Form uses JavaScript rendering; executor waits for networkidle before scraping.
+  # - The first [role='listitem'] is often the Google account email row — skip inputs
+  #   with aria-label="Your email address" since that's auto-filled by the account.
+
+# MS Forms, Typeform, Notion — Phase 3. Stubs left as a reminder.
+# ms_forms: {}
+# typeform: {}
+# notion_form: {}

@@ -1,0 +1,29 @@
+{
+  "platform_id": "notion_forms",
+  "name": "Notion Forms",
+  "url_patterns": [
+    "notion\\.so/forms",
+    "notion\\.site/forms",
+    "notionforms\\.io",
+    "notion\\.so"
+  ],
+  "navigation": {
+    "type": "standard"
+  },
+  "selectors": {
+    "item_selector": ".notion-form-question, div[data-block-id], div.form-field, div.notion-collection-item",
+    "question_selector": "label, .notion-form-label, span.notion-form-title, h3",
+    "short_text_selector": "input[type='text'], input[type='email'], input[type='tel'], input[type='url'], input[type='number']",
+    "paragraph_selector": "textarea",
+    "radio_selector": "input[type='radio'], div[role='radio']",
+    "checkbox_selector": "input[type='checkbox'], div[role='checkbox']",
+    "dropdown_selector": "select, div[role='combobox'], div.notion-dropdown",
+    "dropdown_options_selector": "option, div[role='option']",
+    "required_selector": "span.required, span[aria-hidden='true']:has-text('*')",
+    "submit_selector": "button[type='submit'], .notion-form-submit, button:has-text('Submit')",
+    "confirmation_selector": ".notion-form-success, .form-submitted-message, div:has-text('Thank you'), div:has-text('submitted')"
+  },
+  "quirks": [
+    "Notion forms rendered inside Notion pages or via NotionForms wrapper; match both standard form labels and Notion blocks."
+  ]
+}

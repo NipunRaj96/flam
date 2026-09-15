@@ -1,0 +1,31 @@
+{
+  "platform_id": "google_forms",
+  "name": "Google Forms",
+  "url_patterns": [
+    "docs\\.google\\.com/forms",
+    "forms\\.gle/"
+  ],
+  "navigation": {
+    "type": "standard_or_paginated",
+    "next_button_selector": "[role='button']:has-text('Next'), span:has-text('Next')",
+    "back_button_selector": "[role='button']:has-text('Back')"
+  },
+  "selectors": {
+    "item_selector": "[role='listitem']",
+    "question_selector": "[role='heading']",
+    "short_text_selector": "input[type='text'], input[type='email'], input[type='tel'], input[type='url'], input[type='number']",
+    "paragraph_selector": "textarea",
+    "radio_selector": "[role='radio']",
+    "checkbox_selector": "[role='checkbox']",
+    "dropdown_selector": "[role='listbox'], select",
+    "dropdown_options_selector": "[role='option'], option",
+    "required_selector": "[aria-label*='required'], [aria-required='true']",
+    "submit_selector": "[role='button']:has-text('Submit'), button:has-text('Submit')",
+    "confirmation_selector": ".freebirdFormviewerViewResponseConfirmationMessage, [data-is-touch-wrapper='true'] .vHW8K, .vHW8K"
+  },
+  "quirks": [
+    "Question IDs re-render per session; match elements by role and structure rather than static ID.",
+    "First listitem may be the Google account row; skip inputs with aria-label='Your email address'.",
+    "Short URLs (forms.gle) redirect to docs.google.com — canonical resolution needed before idempotency check."
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "platform_id": "ms_forms",
+  "name": "Microsoft Forms",
+  "url_patterns": [
+    "forms\\.office\\.com",
+    "forms\\.microsoft\\.com"
+  ],
+  "navigation": {
+    "type": "standard_or_paginated",
+    "next_button_selector": "button[data-automation-id='nextButton']",
+    "back_button_selector": "button[data-automation-id='prevButton']"
+  },
+  "selectors": {
+    "item_selector": "div[data-automation-id='questionItem']",
+    "question_selector": "span[data-automation-id='questionTitle'], div.office-form-question-title-text",
+    "short_text_selector": "input[data-automation-id='textInput'], input[type='text'], input[type='email']",
+    "paragraph_selector": "textarea[data-automation-id='textInput'], textarea",
+    "radio_selector": "input[type='radio'], div[role='radio'], div.office-form-question-choice",
+    "checkbox_selector": "input[type='checkbox'], div[role='checkbox']",
+    "dropdown_selector": "div[role='combobox'], select, div[data-automation-id='selectContainer']",
+    "dropdown_options_selector": "div[role='option'], option",
+    "required_selector": "span[data-automation-id='requiredSymbol'], span.required-star",
+    "submit_selector": "button[data-automation-id='submitButton'], button:has-text('Submit')",
+    "confirmation_selector": "div[data-automation-id='thankYouMessage'], .office-form-submitted-container, div:has-text('Your response was submitted')"
+  },
+  "quirks": [
+    "Uses data-automation-id attributes for stable targeting across locales.",
+    "Dropdowns use custom ARIA combobox popups in newer MS Forms layouts."
+  ]
+}
