@@ -74,7 +74,8 @@ class Application(Base):
     The INSERT in idempotency.py catches IntegrityError as the hard backstop
     even if the application-level check was somehow bypassed.
 
-    status flow: drafted → pending_approval → submitted | failed | cancelled
+    status flow: drafted → pending_approval → submitted | unconfirmed | failed | cancelled
+    (unconfirmed = submit was clicked but no confirmation was seen; treated like submitted for dedup)
     """
 
     __tablename__ = "applications"
@@ -86,6 +87,9 @@ class Application(Base):
     platform = Column(String(50), nullable=False)
     status = Column(String(50), nullable=False, default="drafted")
     receipt_path = Column(String(512), nullable=True)  # path to confirmation screenshot
+    role = Column(String(200), nullable=True)
+    company = Column(String(200), nullable=True)
+    failure_reason = Column(String(1000), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     submitted_at = Column(DateTime, nullable=True)
 

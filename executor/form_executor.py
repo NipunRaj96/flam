@@ -10,6 +10,7 @@ Handles:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -17,15 +18,44 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from playwright.async_api import Browser, Locator, Page, Playwright, async_playwright
 
+from executor.confirm import wait_for_confirmation
 from executor.knowledge_base import load_platform_config
 
 if TYPE_CHECKING:
     from generator.answer_generator import AnswerGenerator
+    from intake.post import PostInfo
 
 logger = logging.getLogger(__name__)
 
 RECEIPTS_DIR = Path(__file__).resolve().parent.parent / "receipts"
 RECEIPTS_DIR.mkdir(exist_ok=True)
+
+_CONTROLS = (
+    "input:not([type='hidden']), textarea, select, [role='radio'], [role='checkbox'], "
+    "[role='listbox'], [role='combobox'], [role='slider']"
+)
+
+
+def _entry(question: str, field_type: str, result, handle: Optional[dict] = None) -> dict:
+    return {
+        "question":          question,
+        "value":             result.value,
+        "field_type":        field_type,
+        "skipped":           result.value is None,
+        "flagged":           result.flagged,
+        "source":            result.source,
+        "context_keys_used": result.context_keys_used,
+        "note":              result.note,
+        "_handle":           handle,
+    }
+
+
+def _unsupported(question: str) -> dict:
+    return {
+        "question": question, "value": None, "field_type": "unsupported", "skipped": True,
+        "flagged": True, "source": "manual_required", "context_keys_used": [],
+        "note": "I can't fill this kind of question.", "_handle": None,
+    }
 
 
 class FormExecutor:
@@ -61,31 +91,50 @@ class FormExecutor:
         jd_text: str = "",
         context: Optional[dict[str, str]] = None,
         user_template: Optional[str] = None,
-    ) -> tuple[Page, list[dict]]:
+        post: Optional["PostInfo"] = None,
+    ) -> tuple[Page, list[dict], list[str]]:
         """
-        Navigate to form_url and execute the platform-specific fill routine.
-        Leaves page open for submit() or cancel().
+        Navigate to form_url and fill it. Leaves the page open for submit() / cancel().
+        Returns (page, filled_fields, notes). Notes are warnings to show in the preview.
         """
         assert self._browser is not None, "Call start() first."
         config = load_platform_config(platform_id)
         nav_type = config.get("navigation", {}).get("type", "standard")
 
         page = await self._browser.new_page()
-        logger.info("Navigating to %s (%s)", form_url, platform_id)
-        await page.goto(form_url, wait_until="networkidle", timeout=35_000)
+        try:
+            logger.info("Navigating to %s (%s)", form_url, platform_id)
+            await page.goto(form_url, wait_until="domcontentloaded", timeout=35_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass  # chatty pages never go idle; the content is already there
 
-        if nav_type == "conversational":
-            filled_fields = await self._fill_conversational(page, config, generator, jd_text, context, user_template)
-        else:
-            filled_fields = await self._fill_standard_or_paginated(page, config, generator, jd_text, context, user_template)
+            if "accounts.google.com" in page.url:
+                raise RuntimeError("This form needs a Google sign-in, which I can't do. Open it yourself.")
 
+            args = (page, config, generator, jd_text, context, user_template, post)
+            if nav_type == "conversational":
+                filled_fields = await self._fill_conversational(*args)
+            else:
+                filled_fields = await self._fill_standard_or_paginated(*args)
+
+            if not filled_fields:
+                raise RuntimeError("I couldn't find any questions on that page. The link may be wrong or the form closed.")
+        except Exception:
+            await page.close()
+            raise
+
+        notes: list[str] = []
+        unsupported = [f["question"] for f in filled_fields if f["field_type"] == "unsupported"]
+        if unsupported:
+            notes.append(
+                f"{len(unsupported)} question(s) are a type I can't fill (file upload, date, grid...). "
+                "If they are required, this form may reject the submission."
+            )
         filled_count = sum(1 for f in filled_fields if not f["skipped"])
-        skipped_count = sum(1 for f in filled_fields if f["skipped"])
-        logger.info(
-            "Fill complete on %s: %d field(s) filled, %d skipped",
-            platform_id, filled_count, skipped_count
-        )
-        return page, filled_fields
+        logger.info("Fill complete on %s: %d filled, %d need the user", platform_id, filled_count, len(filled_fields) - filled_count)
+        return page, filled_fields, notes
 
     # -----------------------------------------------------------------------
     # 1. Standard & Paginated Form Fill
@@ -99,11 +148,13 @@ class FormExecutor:
         jd_text: str,
         context: Optional[dict[str, str]],
         user_template: Optional[str],
+        post: Optional["PostInfo"] = None,
     ) -> list[dict]:
         selectors = config.get("selectors", {})
         nav = config.get("navigation", {})
         next_btn_sel = nav.get("next_button_selector")
         filled_fields: list[dict] = []
+        seen: set[str] = set()
         max_pages = 8
         current_page = 1
 
@@ -118,8 +169,8 @@ class FormExecutor:
             items = await page.locator(selectors["item_selector"]).all()
             logger.info("Found %d question block(s) on page %d", len(items), current_page)
 
+            todo: list[dict] = []
             for item in items:
-                # 1. Extract question text
                 headings = await item.locator(selectors["question_selector"]).all()
                 if not headings:
                     continue
@@ -127,44 +178,36 @@ class FormExecutor:
                     question = (await headings[0].text_content(timeout=1_500) or "").strip()
                 except Exception:
                     continue
-                if not question:
+                if not question or question in seen:
                     continue
 
-                # Skip if already answered on previous page
-                if any(f["question"] == question for f in filled_fields):
-                    continue
-
-                # 2. Detect field type & available choices
                 field_type, choices, target_inputs = await self._detect_field_type(page, item, selectors)
                 if field_type == "unknown":
+                    # Real question with a control we can't drive (file, date, grid)? Show it. Headers/text blocks: ignore.
+                    if await item.locator(_CONTROLS).count():
+                        seen.add(question)
+                        filled_fields.append(_unsupported(question))
                     continue
+                seen.add(question)
+                todo.append({"item": item, "question": question, "field_type": field_type,
+                             "choices": choices, "inputs": target_inputs})
 
-                # 3. Generate answer
-                result = await generator.generate(
-                    question=question,
-                    field_type=field_type,
-                    jd_text=jd_text,
-                    context=context,
-                    user_template=user_template,
-                    choices=choices,
-                )
+            # Ask the model for every answer on this page at once, then fill in order.
+            results = await asyncio.gather(*[
+                generator.generate(
+                    question=t["question"], field_type=t["field_type"], jd_text=jd_text,
+                    context=context, user_template=user_template, choices=t["choices"], post=post,
+                ) for t in todo
+            ])
 
-                # 4. Perform Playwright fill action
+            for t, result in zip(todo, results):
                 if result.value:
                     try:
-                        await self._perform_fill_action(page, item, field_type, result.value, target_inputs, selectors)
+                        await self._perform_fill_action(page, t["item"], t["field_type"], result.value, t["inputs"], selectors)
                     except Exception as exc:
-                        logger.warning("Error filling %r (%s): %s", question, field_type, exc)
-
-                filled_fields.append({
-                    "question":          question,
-                    "value":             result.value,
-                    "field_type":        field_type,
-                    "skipped":           result.value is None,
-                    "flagged":           result.flagged,
-                    "source":            result.source,
-                    "context_keys_used": result.context_keys_used,
-                })
+                        logger.warning("Error filling %r (%s): %s", t["question"], t["field_type"], exc)
+                filled_fields.append(_entry(t["question"], t["field_type"], result,
+                                            handle={"item": t["item"], "inputs": t["inputs"], "selectors": selectors}))
 
             # Check for pagination (Next button)
             if next_btn_sel:
@@ -205,6 +248,7 @@ class FormExecutor:
         jd_text: str,
         context: Optional[dict[str, str]],
         user_template: Optional[str],
+        post: Optional["PostInfo"] = None,
     ) -> list[dict]:
         selectors = config.get("selectors", {})
         nav = config.get("navigation", {})
@@ -267,6 +311,7 @@ class FormExecutor:
                 context=context,
                 user_template=user_template,
                 choices=choices,
+                post=post,
             )
 
             if result.value:
@@ -275,15 +320,7 @@ class FormExecutor:
                 except Exception as exc:
                     logger.warning("Error in conversational step: %s", exc)
 
-            filled_fields.append({
-                "question":          question,
-                "value":             result.value,
-                "field_type":        field_type,
-                "skipped":           result.value is None,
-                "flagged":           result.flagged,
-                "source":            result.source,
-                "context_keys_used": result.context_keys_used,
-            })
+            filled_fields.append(_entry(question, field_type, result))  # no handle: the step has moved on
 
             # Advance to next block: click OK button or press Enter
             ok_btns = await target_block.locator(nav.get("next_button_selector", "button:has-text('OK')")).all()
@@ -311,7 +348,10 @@ class FormExecutor:
         radios = await item.locator(selectors.get("radio_selector", "[role='radio']")).all()
         checkboxes = await item.locator(selectors.get("checkbox_selector", "[role='checkbox']")).all()
         dropdowns = await item.locator(selectors.get("dropdown_selector", "select")).all()
+        dates = await item.locator("input[type='date']").all()
 
+        if dates and await dates[0].is_visible():
+            return "date", None, dates[:1]
         if short_inputs and await short_inputs[0].is_visible():
             return "short_text", None, short_inputs[:1]
         elif paras and await paras[0].is_visible():
@@ -384,7 +424,7 @@ class FormExecutor:
         target_inputs: list[Locator],
         selectors: dict[str, str],
     ) -> None:
-        if field_type in ("short_text", "paragraph"):
+        if field_type in ("short_text", "paragraph", "date"):
             for inp in target_inputs:
                 await inp.fill(value)
         elif field_type == "radio":
@@ -445,31 +485,38 @@ class FormExecutor:
     # submit & cancel
     # -----------------------------------------------------------------------
 
-    async def submit(self, page: Page, platform_id: str, application_id: int) -> str:
-        """Click submit, verify confirmation selector, save screenshot receipt."""
+    async def submit(self, page: Page, platform_id: str, application_id: int) -> tuple[str, bool]:
+        """Click submit, check it really went through, save a screenshot. Returns (receipt_path, confirmed)."""
         config = load_platform_config(platform_id)
         selectors = config.get("selectors", {})
         submit_sel = selectors.get("submit_selector", "button:has-text('Submit')")
+        conf_sel = selectors.get("confirmation_selector")
+
+        already_visible = False
+        if conf_sel:
+            try:
+                already_visible = await page.locator(conf_sel).first.is_visible()
+            except Exception:
+                pass
 
         submit_btn = page.locator(submit_sel).first
+        await submit_btn.scroll_into_view_if_needed()
         await submit_btn.click()
         logger.info("Submit clicked for application %d on %s", application_id, platform_id)
 
-        conf_sel = selectors.get("confirmation_selector")
-        if conf_sel:
-            try:
-                await page.wait_for_selector(conf_sel, timeout=15_000)
-            except Exception as exc:
-                await self._screenshot(page, f"submit_error_{application_id}")
-                raise RuntimeError(
-                    f"Confirmation element not found after submit on {platform_id} — "
-                    "submission may not have gone through."
-                ) from exc
-
-        receipt_path = await self._screenshot(page, f"receipt_{application_id}")
-        logger.info("Receipt saved: %s", receipt_path)
+        confirmed = await wait_for_confirmation(page, None if already_visible else conf_sel)
+        label = f"receipt_{application_id}" if confirmed else f"unconfirmed_{application_id}"
+        receipt_path = await self._screenshot(page, label)
         await page.close()
-        return receipt_path
+        logger.info("Receipt saved: %s (confirmed=%s)", receipt_path, confirmed)
+        return receipt_path, confirmed
+
+    async def refill(self, page: Page, field: dict, value: str) -> None:
+        """Change one answer in the live form (used by /edit)."""
+        h = field.get("_handle")
+        if not h:
+            raise RuntimeError("That answer can't be changed in the live form.")
+        await self._perform_fill_action(page, h["item"], field["field_type"], value, h["inputs"], h["selectors"])
 
     async def cancel(self, page: Page) -> None:
         await page.close()

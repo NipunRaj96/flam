@@ -27,8 +27,10 @@ TYPE_RESUME    = "resume"
 TYPE_GITHUB    = "github"
 TYPE_LINKEDIN  = "linkedin"
 TYPE_PORTFOLIO = "portfolio"
+TYPE_FACTS     = "structured_facts"   # auto-extracted from the resume (JSON)
+TYPE_USER_FACTS = "user_facts"        # set by the user with /fact; always wins (JSON)
 
-ALL_TYPES = (TYPE_RESUME, TYPE_GITHUB, TYPE_LINKEDIN, TYPE_PORTFOLIO)
+ALL_TYPES = (TYPE_RESUME, TYPE_GITHUB, TYPE_LINKEDIN, TYPE_PORTFOLIO, TYPE_FACTS, TYPE_USER_FACTS)
 
 # How many GitHub repos to inject per JD (keeps context window tight)
 DEFAULT_TOP_N_REPOS = 3
@@ -94,6 +96,32 @@ async def get_context(user_id: int) -> dict[str, str]:
         )
         rows = result.scalars().all()
         return {row.type: row.content for row in rows}
+
+
+def get_facts(ctx: dict[str, str]) -> dict[str, str]:
+    """Merge resume-extracted facts with the user's own /fact overrides (user wins)."""
+    facts: dict[str, str] = {}
+    for key in (TYPE_FACTS, TYPE_USER_FACTS):
+        try:
+            data = json.loads(ctx.get(key) or "{}")
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            facts.update({k: str(v) for k, v in data.items() if str(v).strip()})
+    return facts
+
+
+async def set_user_fact(user_id: int, key: str, value: str) -> None:
+    ctx = await get_context(user_id)
+    try:
+        current = json.loads(ctx.get(TYPE_USER_FACTS) or "{}")
+    except ValueError:
+        current = {}
+    if value:
+        current[key] = value
+    else:
+        current.pop(key, None)
+    await upsert_context(user_id, TYPE_USER_FACTS, json.dumps(current))
 
 
 async def has_context(user_id: int) -> bool:
@@ -167,7 +195,8 @@ def _filter_relevant_repos(
         desc    = r.get("description") or "No description"
         lang    = r.get("language") or "unknown"
         summary = r.get("readme_summary", "")
-        lines.append(f"• {name} ({lang}): {desc}")
+        url     = r.get("url", "")
+        lines.append(f"• {name} ({lang}): {desc}" + (f" [{url}]" if url else ""))
         if summary:
             lines.append(f"  Summary: {summary}")
     return "\n".join(lines)

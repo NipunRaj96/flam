@@ -1,118 +1,93 @@
 """
-Resume extraction and parsing utilities.
+Resume extraction: PDF -> text, and text -> structured candidate facts.
 
-Supports:
-- Extracting raw text from PDF files using pdfplumber.
-- Extracting key structured fields (name, email, phone, links, education)
-  using regex and Groq structured extraction, so that both static identity
-  fields and LLM open-ended answers are grounded in the user's real resume.
+Facts feed the "boring" form fields (name, phone, college...) so those are
+filled from your real data and never guessed by the model.
 """
 from __future__ import annotations
 
 import io
-import json
 import logging
 import re
-from typing import Optional
 
 import pdfplumber
-from groq import AsyncGroq
+
+from generator import llm
 
 logger = logging.getLogger(__name__)
 
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_PHONE_RE = re.compile(r"(?:\+\d{1,3}[-.\s]?)?(?:\(?\d{3,5}\)?[-.\s]?){2,3}\d{2,4}")
+_LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w%-]+/?", re.IGNORECASE)
+_GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w-]+/?", re.IGNORECASE)
+
 
 def extract_text_from_pdf(pdf_bytes_or_path: bytes | str) -> str:
-    """
-    Extract text content from a PDF file path or byte stream using pdfplumber.
-    """
-    text_parts = []
-    if isinstance(pdf_bytes_or_path, bytes):
-        stream = io.BytesIO(pdf_bytes_or_path)
-        with pdfplumber.open(stream) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    text_parts.append(t.strip())
-    else:
-        with pdfplumber.open(pdf_bytes_or_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    text_parts.append(t.strip())
-
-    full_text = "\n\n".join(text_parts).strip()
-    return full_text
+    src = io.BytesIO(pdf_bytes_or_path) if isinstance(pdf_bytes_or_path, bytes) else pdf_bytes_or_path
+    parts = []
+    with pdfplumber.open(src) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                parts.append(t.strip())
+    return "\n\n".join(parts).strip()
 
 
-async def extract_structured_profile_from_resume(
-    resume_text: str,
-    groq_api_key: Optional[str] = None,
-    model: str = "qwen/qwen3.8-27b",
-) -> dict[str, str]:
-    """
-    Extract structured candidate fields from resume text.
-    Returns a dict with standard profile keys:
-      name, email, phone, linkedin, github, portfolio, college, degree, graduation_year, cgpa, experience, about
-    """
-    # Quick regex extractors for standard identifiers
-    extracted: dict[str, str] = {}
+def regex_facts(text: str) -> dict[str, str]:
+    """Identifiers that regex finds reliably."""
+    out: dict[str, str] = {}
+    if m := _EMAIL_RE.search(text):
+        out["email"] = m.group(0)
+    if m := _LINKEDIN_RE.search(text):
+        out["linkedin"] = m.group(0)
+    if m := _GITHUB_RE.search(text):
+        out["github"] = m.group(0)
+    head = text[:600]  # phone is in the header; avoids matching years/ids further down
+    if m := _PHONE_RE.search(head):
+        digits = re.sub(r"\D", "", m.group(0))
+        if 9 <= len(digits) <= 14:
+            out["phone"] = m.group(0).strip()
+    return out
 
-    email_match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", resume_text)
-    if email_match:
-        extracted["email"] = email_match.group(0)
 
-    phone_match = re.search(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", resume_text)
-    if phone_match:
-        extracted["phone"] = phone_match.group(0)
+_PROMPT = """\
+Extract facts about the candidate from this resume. Return a JSON object with exactly these keys.
+Use "" for anything the resume does not state. Never guess or infer.
 
-    linkedin_match = re.search(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w-]+", resume_text, re.IGNORECASE)
-    if linkedin_match:
-        extracted["linkedin"] = linkedin_match.group(0)
+"name": full name
+"email", "phone", "linkedin", "github", "portfolio": as written
+"location": current city/country if stated
+"college": most recent university or college
+"degree": degree and major
+"graduation_year": year, digits only
+"cgpa": CGPA/GPA/percentage as written
+"current_company": current or most recent employer
+"current_title": current or most recent job title
+"years_experience": only if the resume literally states a number of years of experience (do not work it out from dates), else ""
+"skills": the 12 most important skills, comma separated
+"about": two plain sentences on who this person is professionally, in first person, no buzzwords
 
-    github_match = re.search(r"(?:https?://)?(?:www\.)?github\.com/[\w-]+", resume_text, re.IGNORECASE)
-    if github_match:
-        extracted["github"] = github_match.group(0)
-
-    if not groq_api_key:
-        return extracted
-
-    # Use Groq to accurately extract candidate identity and education facts from the resume
-    try:
-        client = AsyncGroq(api_key=groq_api_key)
-        prompt = f"""\
-Extract factual candidate profile details from the resume below.
-Return a valid JSON object ONLY, with these exact keys (leave value as empty string if not found):
-- "name": candidate full name
-- "email": candidate email
-- "phone": candidate phone number
-- "linkedin": linkedin profile url
-- "github": github profile url
-- "portfolio": portfolio/website url
-- "college": university/college name
-- "degree": degree name / major (e.g. B.Tech in Computer Science)
-- "graduation_year": year of graduation (e.g. 2025)
-- "cgpa": CGPA or GPA or percentage (e.g. 8.5/10)
-- "about": 2-sentence summary of candidate background and strengths
-
-Resume:
+RESUME:
 \"\"\"
-{resume_text[:4000]}
+{text}
 \"\"\"
 """
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=400,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content.strip()
-        data = json.loads(content)
-        # Merge with non-empty keys
-        for k, v in data.items():
-            if isinstance(v, str) and v.strip():
-                extracted[k] = v.strip()
-    except Exception as exc:
-        logger.warning("Groq structured extraction on resume failed: %s", exc)
 
-    return extracted
+
+async def extract_structured_profile_from_resume(resume_text: str) -> dict[str, str]:
+    facts = regex_facts(resume_text)
+    if not llm.has_llm():
+        return facts
+    try:
+        data = await llm.chat_json(
+            [{"role": "user", "content": _PROMPT.format(text=resume_text[:6000])}],
+            temperature=0.0, max_tokens=700,
+        )
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, str) and v.strip():
+                    # regex hits for identifiers stay; the model fills the rest
+                    facts.setdefault(k, v.strip())
+    except Exception as exc:
+        logger.warning("Resume fact extraction failed: %s", exc)
+    return facts

@@ -1,15 +1,13 @@
 """
-Bot entry point — Phase 3 Multi-Platform & Channel Architecture.
+Bot entry point.
 
 Startup order:
-  1. Load .env from secrets/.env
-  2. Setup rotating file logs & telemetry
-  3. init_db() + create_tables() — schema & auto-migrations verified
-  4. Start FormExecutor and CustomPageExecutor
-  5. Init AnswerGenerator with Groq key and fallback profile
-  6. Init EmailApplicationService
-  7. Register command, document, and text handlers
-  8. Start polling Telegram
+  1. Load secrets/.env
+  2. Telemetry + file logs
+  3. DB tables, then cancel drafts left over from a previous run
+  4. Start browsers, email service, answer generator
+  5. Register handlers (commands, text, photos, documents) and an error handler
+  6. Poll Telegram
 """
 from __future__ import annotations
 
@@ -20,22 +18,21 @@ import signal
 import sys
 from pathlib import Path
 
-# Ensure project root is in sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dotenv import load_dotenv
-from telegram import BotCommand
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram import BotCommand, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-from bot import handlers
+from bot import handlers, state
 from custom_page.executor import CustomPageExecutor
 from db.session import create_tables, init_db
 from email_service.router import EmailApplicationService
 from executor.form_executor import FormExecutor
 from generator.answer_generator import AnswerGenerator
-from profiles.static_test import STATIC_PROFILE
+from idempotency import cancel_stale_applications
 from telemetry.logger import setup_telemetry
 
 logging.basicConfig(
@@ -47,27 +44,52 @@ logger = logging.getLogger(__name__)
 
 _ENV_PATH = _PROJECT_ROOT / "secrets" / ".env"
 
+_MENU = [
+    ("start", "How to use flam"),
+    ("upload", "Upload your resume (PDF or text)"),
+    ("update_github", "Sync your GitHub projects"),
+    ("linkedin", "Add LinkedIn text"),
+    ("fact", "Set facts like notice period or CTC"),
+    ("template", "Set how your answers sound"),
+    ("edit", "Change an answer in the preview"),
+    ("approve", "Submit the pending application"),
+    ("cancel", "Discard the pending application"),
+    ("status", "What I know about you"),
+    ("history", "Recent applications"),
+]
+
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled error", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Something went wrong on my side. Please try again. If it keeps happening, check /logs."
+            )
+        except Exception:
+            pass
+
 
 async def main() -> None:
     load_dotenv(dotenv_path=_ENV_PATH)
-
-    # --- 1. Setup Telemetry & File Logs ---
     setup_telemetry()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN is not set. Check secrets/.env.")
         sys.exit(1)
+    if not os.getenv("GROQ_API_KEY"):
+        logger.warning("GROQ_API_KEY is not set: answers, email drafts and screenshot reading will not work.")
+    if not os.getenv("ALLOWED_TELEGRAM_IDS", "").strip():
+        logger.warning("ALLOWED_TELEGRAM_IDS is not set: ANYONE who finds this bot can use it. "
+                       "Add your Telegram user id to secrets/.env.")
 
-    database_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./flam.db")
-
-    # --- 2. DB setup & auto-migration ---
-    logger.info("Initialising database at %s", database_url)
-    init_db(database_url)
+    init_db(os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./flam.db"))
     await create_tables()
-    logger.info("Database ready (all tables + idempotency constraint + schema synced)")
+    stale = await cancel_stale_applications()
+    if stale:
+        logger.info("Cancelled %d draft(s) left over from the last run", stale)
 
-    # --- 3. Playwright Executors ---
     form_executor = FormExecutor()
     await form_executor.start()
     handlers.set_executor(form_executor)
@@ -76,67 +98,26 @@ async def main() -> None:
     await custom_page_executor.start()
     handlers.set_custom_page_executor(custom_page_executor)
 
-    # --- 4. Email Service ---
-    email_service = EmailApplicationService()
-    handlers.set_email_service(email_service)
+    handlers.set_email_service(EmailApplicationService())
+    handlers.set_generator(AnswerGenerator())
 
-    # --- 5. Answer Generator ---
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    generator = AnswerGenerator(
-        groq_api_key=groq_api_key,
-        fallback_profile=STATIC_PROFILE,
-    )
-    handlers.set_generator(generator)
-
-    # --- 6. Build Telegram application ---
     app = ApplicationBuilder().token(token).build()
+    await app.bot.set_my_commands([BotCommand(c, d) for c, d in _MENU])
 
-    # Set bot commands in Telegram menu
-    await app.bot.set_my_commands([
-        BotCommand("start", "Show welcome & instructions"),
-        BotCommand("upload", "Upload resume (PDF or text)"),
-        BotCommand("update_github", "Sync GitHub repos & summaries"),
-        BotCommand("linkedin", "Add LinkedIn profile details"),
-        BotCommand("template", "Customize tone & style instructions"),
-        BotCommand("add_mail_auth", "Connect Gmail/Outlook OAuth for email applications"),
-        BotCommand("status", "Check candidate context status"),
-        BotCommand("logs", "View recent debug logs and metrics"),
-        BotCommand("approve", "Submit the pending application"),
-        BotCommand("cancel", "Abort the pending application"),
-    ])
-
-    # Register handlers
-    app.add_handler(CommandHandler("start", handlers.handle_start))
-    app.add_handler(CommandHandler("upload", handlers.handle_upload))
-    app.add_handler(CommandHandler("update_github", handlers.handle_update_github))
-    app.add_handler(CommandHandler("github", handlers.handle_update_github))
-    app.add_handler(CommandHandler("linkedin", handlers.handle_linkedin))
-    app.add_handler(CommandHandler("template", handlers.handle_template))
-    app.add_handler(CommandHandler("add_mail_auth", handlers.handle_add_mail_auth))
+    for name, fn in handlers._COMMANDS.items():
+        app.add_handler(CommandHandler(name, fn))
     app.add_handler(CommandHandler("add-mail-auth", handlers.handle_add_mail_auth))
-    app.add_handler(CommandHandler("status", handlers.handle_status))
-    app.add_handler(CommandHandler("logs", handlers.handle_logs))
-    app.add_handler(CommandHandler("approve", handlers.handle_approve))
-    app.add_handler(CommandHandler("cancel", handlers.handle_cancel))
-
-    # Document (PDF) handler
+    app.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handlers.handle_document))
-
-    # Text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
+    app.add_error_handler(_on_error)
 
-    logger.info("Bot starting — polling for updates…")
-
+    logger.info("Bot starting - polling for updates")
     stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
-
-    def _request_shutdown() -> None:
-        logger.info("Shutdown signal received.")
-        stop_event.set()
-
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _request_shutdown)
+            loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
             pass
 
@@ -146,13 +127,19 @@ async def main() -> None:
         await app.updater.start_polling(drop_pending_updates=True)
         await stop_event.wait()
     finally:
-        logger.info("Shutting down…")
+        logger.info("Shutting down")
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        for pending in state.all_pending():  # close live pages left open
+            if pending.page:
+                try:
+                    await pending.page.close()
+                except Exception:
+                    pass
         await form_executor.stop()
         await custom_page_executor.stop()
-        logger.info("Shutdown complete.")
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

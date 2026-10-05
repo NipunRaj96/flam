@@ -1,144 +1,92 @@
 # flam — AI Job Application Agent
 
 > [!NOTE]
-> **Active Development & Iteration Phase**: This project is currently in active development and iteration. Architecture, features, and platform capabilities are actively evolving.
+> **Active development.** Features and platform support are still evolving.
 
-**flam** is an autonomous AI agent operated via Telegram that parses, drafts, and submits job applications across forms, custom career portals, and email applications on your behalf.
+**flam** is a Telegram bot that applies to jobs for you. Send it anything that says how to apply and it drafts the answers in your own voice, shows you a preview, and submits only after you approve.
 
-Paste a job post or application link → the agent cross-references the Job Description against your real candidate profile (Resume PDF, GitHub repos, LinkedIn) → generates grounded answers in a natural human voice → you review and approve → Playwright submits the application and sends you a screenshot confirmation receipt.
+## What you can send it
 
----
+- A **form or career-page link** (Google Forms, MS Forms, Typeform, Notion Forms, Greenhouse/Lever-style pages)
+- A post that says **"mail me at …"**: paste it, forward it, or send a **screenshot** (it reads the image, finds the email, and follows any instructions in the post such as the exact subject line)
+- A **job PDF**
 
-## ✨ Features
+For forms and career pages it fills the form and shows a numbered preview. For emails it writes the subject and body and gives you a one-tap **Open in Gmail** link, since it does not send mail by itself (see Limits).
 
-- **Multi-Platform Form Engine**: On-demand JSON knowledge base supporting **Google Forms**, **Microsoft Forms**, **Typeform**, and **Notion Forms** with multi-page pagination and multi-field handling (radio, checkbox, dropdown, short/long text).
-- **Custom Career Page Automation**: Self-hosted, open-source browser agent (`browser-use` OSS + local Playwright + Groq) that navigates unknown application portals with field confidence scoring.
-- **Email Application Flow**: Auto-detects job postings with recruiter emails, generates tailored subject lines and cover notes, and prepares 1-tap OAuth / `mailto:` dispatch with zero stored passwords.
-- **Context Grounding & Style Matching**:
-  - Upload PDF resumes (extracted via `pdfplumber`).
-  - Sync public GitHub repositories with automated Groq README summarization.
-  - Paste LinkedIn profile summaries.
-  - User-customizable tone & style templates (`/template edit <prompt>`).
-  - Strict human-sounding formatting: clean bullet points, natural line breaks, and zero markdown formatting artifacts (`**bold**` or `[links]()`) injected into web forms.
-- **Universal Idempotency & Rate Limiting**: DB-enforced `UNIQUE(user_id, jd_hash, form_id)` constraint prevents accidental double-submits, coupled with a configurable daily submission limit.
+## How answers are written
 
----
+- Plain, specific, first person. No buzzwords, no "I am excited to…", no markdown, no em dashes.
+- Technical work is explained in everyday words unless the post itself uses the technical term.
+- **Only facts from your profile.** Plain questions (name, college, phone, notice period…) are copied from your saved facts. Anything it doesn't know is flagged for you, never guessed. Visa status, salary, gender and similar questions are never answered for you.
+- Respects limits like "max 300 characters" or "in 100 words".
+- You control the tone with `/template`, and add facts a resume doesn't say with `/fact`.
 
-## 🏗️ Architecture
-
-```
-flam/
-├── bot/                     # Telegram interface & command dispatch
-│   ├── main.py              #   Bot entry point & handler registration
-│   ├── handlers.py          #   Command handlers (/upload, /update_github, /approve, etc.)
-│   └── state.py             #   In-memory pending-application state machine
-│
-├── form_knowledge_base/     # Deterministic platform DOM matching rules
-│   ├── google_forms.json    #   Google Forms selector definitions & confirmation rules
-│   ├── ms_forms.json        #   Microsoft Forms DOM structure
-│   ├── notion_forms.json    #   Notion Forms DOM structure
-│   └── typeform.json        #   Typeform conversational navigation rules
-│
-├── classifier/              # URL pattern matching & platform router
-│   └── link.py              #   Classifies into known form, email, or custom page
-│
-├── executor/                # Playwright automation layer
-│   ├── form_executor.py     #   Unified executor driving Playwright via platform configs
-│   └── knowledge_base.py    #   On-demand config loader
-│
-├── custom_page/             # Self-hosted browser agent for career portals
-│   └── executor.py          #   browser-use OSS + Groq vision/LLM fallback
-│
-├── email_service/           # Email job application router
-│   └── router.py            #   OAuth & mailto cover note generator
-│
-├── context/                 # Candidate context store & parsers
-│   ├── store.py             #   Versioned context store & JD-aware repo filtering
-│   ├── github.py            #   GitHub API pull + Groq README summarization
-│   └── resume.py            #   PDF resume extraction & fact parsing
-│
-├── generator/               # Answer synthesis & prompt engineering
-│   ├── answer_generator.py  #   Core AnswerGenerator class
-│   └── prompts.py           #   Grounded prompt templates & human formatting rules
-│
-├── db/                      # Persistence layer
-│   ├── models.py            #   SQLAlchemy models (Users, Applications, Answers, Context)
-│   └── session.py           #   Async SQLite session management
-│
-├── telemetry/               # Logging and monitoring
-│   └── logger.py            #   Structured JSON telemetry & event logging
-│
-├── idempotency.py           # Rate limiting & deduplication guards
-├── requirements.txt         # Project dependencies
-└── README.md
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Clone & Setup Environment
+## Quick start
 
 ```bash
-git clone https://github.com/NipunRaj96/Flam.git
-cd Flam
-
-# Create and activate virtual environment (Python 3.10+)
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
+git clone https://github.com/NipunRaj96/Flam.git && cd Flam
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-```
-
-### 2. Configure Environment
-
-Copy the example environment file:
-```bash
-cp secrets/.env.example secrets/.env
-```
-
-Edit `secrets/.env`:
-```env
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_from_botfather
-GROQ_API_KEY=your_groq_api_key
-MAX_DAILY_SUBMISSIONS=20
-VISION_CONFIDENCE_THRESHOLD=0.8
-```
-
-### 3. Run the Bot
-
-```bash
+cp secrets/.env.example secrets/.env      # then fill it in
 python -m bot.main
 ```
 
----
+`secrets/.env`:
 
-## 📱 Telegram Commands
+```env
+TELEGRAM_BOT_TOKEN=...            # from @BotFather
+GROQ_API_KEY=...
+ALLOWED_TELEGRAM_IDS=123456789    # your Telegram user id. If empty, ANYONE can use your bot.
+MAX_DAILY_SUBMISSIONS=20
+# GROQ_MODEL=qwen/qwen3.8-27b     # default; the same model reads screenshots
+```
 
-| Command | Description |
+## Commands
+
+| Command | What it does |
 |---|---|
-| `/start` | Welcome overview and usage guide |
-| `/upload` | Upload resume as a **PDF document** or paste text |
-| `/update_github <username>` | Sync public repositories & summarize READMEs via Groq |
-| `/linkedin` | Paste LinkedIn profile summary & work history |
-| `/template` | View or customize tone/style instructions (`/template edit <prompt>`) |
-| `/status` | View active candidate context (resume version, GitHub repos, template) |
-| `/logs` | View recent telemetry events and activity summary |
-| `/approve` | Submit the pending application |
-| `/cancel` | Cancel the pending application draft |
+| `/upload` | Save your resume (PDF or text). The PDF is kept so file-upload fields can use it |
+| `/update_github <user>` | Pull and summarise your public repos |
+| `/linkedin` | Paste your profile text |
+| `/fact <key> <value>` | Add facts like `notice_period`, `current_ctc`, `expected_ctc`, `location`, `relocate`, `work_authorization` |
+| `/template` | Set how your answers should sound |
+| `/edit <n> <answer>` | Change answer *n* in the preview (`/edit subject …` / `/edit body …` for email) |
+| `/approve` · `/cancel` | Submit or discard the pending application |
+| `/status` · `/history` · `/logs` | What it knows · past applications · telemetry |
 
----
+## Layout
 
-## 🛡️ Security & Privacy
+```
+bot/            Telegram handlers, in-memory pending state, entry point
+intake/         post.py: reads a post once (role, company, contact, what they ask for)
+classifier/     link.py: form link vs email vs career page; handles "name [at] x [dot] com"
+generator/      answer_generator.py (facts first, model second), prompts.py, humanize.py, llm.py
+executor/       form_executor.py (known platforms, driven by form_knowledge_base/*.json), confirm.py
+custom_page/    executor.py: DOM scan of any career page, resume upload, submit check
+email_service/  router.py: draft + Gmail/mailto links + receipt
+context/        resume, GitHub and LinkedIn store, structured facts
+idempotency.py  duplicate guard, rate limit, application lifecycle
+tests/          python -m tests.test_offline  (no network needed)
+```
 
-- **Zero Stored Passwords**: Email workflows use OAuth device tokens or native `mailto:` links; no plain-text passwords or credentials are ever stored.
-- **Local Storage**: All context versions, candidate data, and receipts are stored locally in your SQLite database and filesystem.
-- **Strict Deduplication**: Applications cannot be submitted twice for the same job description and form URL.
+## Safety
 
----
+- **Preview first.** Nothing is submitted without `/approve`. If answers are still empty, `/approve` warns once before submitting.
+- **No duplicates.** A finished application for the same job and target is blocked (screenshots and re-typed posts of the same job are recognised). Failed or cancelled attempts can be retried.
+- **Submit is verified**, not assumed. If the click can't be confirmed you are told, and it is kept as applied so you don't double-apply.
+- **Consent boxes are never ticked** for you; personal questions are never answered for you.
+- Your data stays local (SQLite + `data/`). Resume text is sent to Groq to write answers.
 
-## 📄 License
+## Limits (honest list)
 
-MIT License.
+- **Email is not sent automatically.** You tap the Gmail link, attach your resume and press send; `/approve` then logs it. Automatic sending needs a Gmail OAuth app (`GOOGLE_CLIENT_ID`, `OAUTH_REDIRECT_URI`) that is not wired up.
+- Google Forms is the most tested platform. MS Forms, Typeform and Notion selectors are unverified against live forms.
+- Career pages: single-page forms only. Multi-step portals (Workday-style), CAPTCHAs and custom dropdown widgets are flagged, not handled. Forms behind a login can't be opened.
+- File uploads other than your resume are not supported.
+- `/edit` can't change answers on Typeform (the live step has already moved on).
+- Outcome tracking (phase 4) is not built.
+
+## License
+
+MIT

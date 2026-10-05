@@ -67,3 +67,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Saved resume PDFs (personal data)
+data/

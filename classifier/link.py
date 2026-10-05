@@ -1,11 +1,10 @@
 """
-Link & Channel Classifier — extracts application channels from pasted job postings.
+Link & channel classifier — finds how to apply from pasted (or screenshot-read) text.
 
-Classifies incoming text into:
-1. Known form platforms (loaded dynamically from /form_knowledge_base/*.json):
-   - google_forms, ms_forms, typeform, notion_forms
-2. Email-based applications (mailto: or recruitment email addresses like jobs@, careers@, apply@)
-3. Custom career pages (Greenhouse, Lever, Workday, company ATS pages)
+Channels, in priority order:
+1. Known form platform URL (loaded from /form_knowledge_base/*.json)
+2. An email address (any email in the post: the user sent it to apply)
+3. Any other apply-looking URL -> custom career page
 """
 from __future__ import annotations
 
@@ -14,99 +13,104 @@ from typing import Optional
 
 from executor.knowledge_base import discover_platform_patterns, get_supported_platforms
 
-_URL_RE = re.compile(
-    r"https?://"
-    r"[^\s<>\"{}|\\^`\[\]]+"
+_URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+_MAILTO_RE = re.compile(r"mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)", re.IGNORECASE)
+
+# "name [at] company [dot] com", "name (at) company.com"
+_AT_RE = re.compile(r"\s*[\[\(\{<]\s*at\s*[\]\)\}>]\s*", re.IGNORECASE)
+_DOT_RE = re.compile(r"\s*[\[\(\{<]\s*dot\s*[\]\)\}>]\s*", re.IGNORECASE)
+# OCR / formatting often puts spaces around the @:  "name @ company.com"
+_SPACED_AT_RE = re.compile(r"([A-Za-z0-9._%+-]+)\s+@\s+([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
+
+_HINT_WORDS = ("mail", "email", "e-mail", "send", "apply", "share", "drop", "reach", "forward",
+               "resume", "cv", "contact", "write to", "ping", "dm")
+_HIRING_LOCALS = ("career", "job", "hr", "talent", "recruit", "hiring", "apply", "people")
+_NOISE_LOCALS = ("noreply", "no-reply", "donotreply", "do-not-reply", "unsubscribe")
+
+# Never an apply target: social/login-walled pages.
+_SKIP_DOMAINS = (
+    "linkedin.com", "twitter.com", "x.com", "facebook.com", "instagram.com", "t.me",
+    "wa.me", "youtube.com", "youtu.be", "github.com", "medium.com", "discord.gg",
 )
 
-_MAILTO_RE = re.compile(r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", re.IGNORECASE)
-_EMAIL_RE = re.compile(r"\b([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)\b")
 
-_RECRUITMENT_KEYWORDS = {
-    "apply", "resume", "cv", "job", "career", "hiring", "position", "candidate", "role"
-}
+def deobfuscate(text: str) -> str:
+    text = _AT_RE.sub("@", text)
+    text = _DOT_RE.sub(".", text)
+    return _SPACED_AT_RE.sub(r"\1@\2", text)
 
 
 def extract_urls(text: str) -> list[str]:
-    """Return all http/https URLs found in the text."""
-    return _URL_RE.findall(text)
+    return [u.rstrip(".,;:!?)'\"]") for u in _URL_RE.findall(text)]
+
+
+def extract_emails(text: str) -> list[str]:
+    text = deobfuscate(text)
+    seen: list[str] = []
+    for e in _MAILTO_RE.findall(text) + _EMAIL_RE.findall(text):
+        e = e.strip(".").lower()
+        if e not in seen:
+            seen.append(e)
+    return seen
+
+
+def pick_apply_email(text: str, emails: list[str]) -> Optional[str]:
+    """Choose the address the post tells you to apply to."""
+    if not emails:
+        return None
+    flat = deobfuscate(text).lower()
+
+    def score(email: str) -> int:
+        s = 0
+        i = flat.find(email)
+        window = flat[max(0, i - 90): i] if i >= 0 else ""
+        if any(w in window for w in _HINT_WORDS):
+            s += 2
+        local = email.split("@")[0]
+        if any(k in local for k in _HIRING_LOCALS):
+            s += 1
+        if any(k in local for k in _NOISE_LOCALS):
+            s -= 3
+        return s
+
+    return max(emails, key=score)  # max() keeps the first of equal scores
 
 
 def classify_url(url: str) -> Optional[str]:
-    """
-    Map a URL to a known platform identifier using dynamic patterns from form_knowledge_base/.
-    Returns None if the URL does not match any known platform.
-    """
-    patterns = discover_platform_patterns()
-    for platform, pats in patterns.items():
-        for pattern in pats:
-            if re.search(pattern, url, re.IGNORECASE):
-                return platform
+    for platform, pats in discover_platform_patterns().items():
+        if any(re.search(p, url, re.IGNORECASE) for p in pats):
+            return platform
     return None
 
 
 def find_application_channel(text: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Identify the application channel from pasted text.
-
-    Returns:
-        (channel_type, target):
-          - ('google_forms' | 'ms_forms' | 'typeform' | 'notion_forms', form_url)
-          - ('email_application', email_address)
-          - ('custom_career_page', page_url)
-          - (None, None) if no application target found.
+    Returns (channel, target):
+      ('google_forms'|'ms_forms'|'typeform'|'notion_forms', url)
+      ('email_application', address)
+      ('custom_career_page', url)
+      (None, None) when there is nothing to apply to.
     """
     urls = extract_urls(text)
 
-    # 1. Check if any URL matches a known platform in form_knowledge_base
     for url in urls:
         platform = classify_url(url)
         if platform:
             return platform, url
 
-    # 2. Check for mailto: or recruitment email address
-    mailto_match = _MAILTO_RE.search(text)
-    if mailto_match:
-        return "email_application", mailto_match.group(1)
+    email = pick_apply_email(text, extract_emails(text))
+    if email:
+        return "email_application", email
 
-    text_lower = text.lower()
-    has_recruitment_kw = any(kw in text_lower for kw in _RECRUITMENT_KEYWORDS)
+    for url in urls:
+        if not any(d in url.lower() for d in _SKIP_DOMAINS):
+            return "custom_career_page", url
 
-    if has_recruitment_kw:
-        emails = _EMAIL_RE.findall(text)
-        if emails:
-            # Prefer emails with apply/careers/jobs in username
-            for email in emails:
-                local_part = email.split("@")[0].lower()
-                if any(k in local_part for k in ("apply", "career", "job", "talent", "hr")):
-                    return "email_application", email
-            return "email_application", emails[0]
-
-    # 3. If there are other URLs and recruitment context, treat as custom career page
-    if urls:
-        # Ignore social links or generic domains if possible
-        for url in urls:
-            u_lower = url.lower()
-            if not any(skip in u_lower for skip in ("linkedin.com/in/", "github.com/", "twitter.com/", "x.com/")):
-                return "custom_career_page", url
-        return "custom_career_page", urls[0]
-
-    return None, None
-
-
-# Backward compatibility helpers
-def find_form_url(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Legacy helper for finding form URLs."""
-    channel, target = find_application_channel(text)
-    if channel and channel != "email_application":
-        return channel, target
     return None, None
 
 
 def is_supported(platform: Optional[str]) -> bool:
-    """Return True if the platform is supported in form_knowledge_base or custom page / email."""
     if not platform:
         return False
-    if platform in ("custom_career_page", "email_application"):
-        return True
-    return platform in get_supported_platforms()
+    return platform in ("custom_career_page", "email_application") or platform in get_supported_platforms()

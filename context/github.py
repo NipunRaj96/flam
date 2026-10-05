@@ -10,13 +10,12 @@ Per Phase 2 specification:
 """
 from __future__ import annotations
 
-import base64
-import json
+import asyncio
 import logging
 from typing import Optional
 
 import httpx
-from groq import AsyncGroq
+from generator import llm
 
 logger = logging.getLogger(__name__)
 
@@ -24,53 +23,33 @@ GITHUB_API_BASE = "https://api.github.com"
 MAX_REPOS_TO_FETCH = 8
 
 
-async def summarize_readme_with_groq(
-    repo_name: str,
-    readme_text: str,
-    groq_api_key: Optional[str],
-    model: str = "qwen/qwen3.8-27b",
-) -> str:
-    """
-    Summarize a GitHub repo README into 1-2 concise, high-impact bullet points.
-    """
-    if not groq_api_key or not readme_text.strip():
+async def summarize_readme_with_groq(repo_name: str, readme_text: str, groq_api_key: Optional[str] = None) -> str:
+    """One or two plain sentences on what a repo is and does."""
+    if not llm.has_llm() or not readme_text.strip():
         return ""
-
+    prompt = (
+        f"Repository: {repo_name}\n"
+        f"README (truncated):\n{readme_text[:3000]}\n\n"
+        "In one or two plain sentences, say what this project does and what it is built with. "
+        "Write so a non-specialist can follow. No marketing words. Output only the sentences."
+    )
     try:
-        client = AsyncGroq(api_key=groq_api_key)
-        prompt = f"""\
-You are summarizing a candidate's GitHub project for their job application context.
-Repository: {repo_name}
-README Content (truncated):
-{readme_text[:3000]}
-
-Provide a 1-2 sentence technical summary highlighting:
-1. What it does / architecture / protocol implemented
-2. Key tools/languages/benchmarks or features
-Do not use marketing fluff. Be direct and technical.
-"""
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=150,
-        )
-        return response.choices[0].message.content.strip()
+        return await llm.chat([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=150)
     except Exception as e:
-        logger.warning("Failed to summarize README for %s with Groq: %s", repo_name, e)
+        logger.warning("README summary failed for %s: %s", repo_name, e)
         return ""
 
 
 async def fetch_github_profile_data(
     username: str,
     groq_api_key: Optional[str] = None,
-) -> str:
+) -> list[dict]:
     """
     Fetch public repositories for a GitHub username, extract and summarize
-    READMEs, and return a JSON string of repository summaries.
+    READMEs, and return the repository summaries.
 
     Returns:
-        JSON string: list of dicts with keys:
+        list of dicts with keys:
           name, description, language, url, stars, readme_summary
     """
     username = username.strip().lstrip("@")
@@ -95,57 +74,30 @@ async def fetch_github_profile_data(
         if repos_res.status_code != 200:
             raise RuntimeError(f"Failed to fetch repositories: {repos_res.status_code}")
 
-        repos_raw = repos_res.json()
-        repos_data = []
+        originals = [r for r in repos_res.json() if not r.get("fork")][:MAX_REPOS_TO_FETCH]
 
-        for repo in repos_raw:
-            if repo.get("fork"):
-                continue  # focus on original projects
-
+        async def _one(repo: dict) -> dict:
             name = repo.get("name", "")
-            description = repo.get("description") or ""
-            language = repo.get("language") or "Unknown"
-            url = repo.get("html_url", "")
-            stars = repo.get("stargazers_count", 0)
-            default_branch = repo.get("default_branch", "main")
-
-            # Try to fetch README
+            branch = repo.get("default_branch", "main")
             readme_text = ""
-            try:
-                # GitHub raw content
-                readme_res = await client.get(
-                    f"https://raw.githubusercontent.com/{username}/{name}/{default_branch}/README.md"
-                )
-                if readme_res.status_code == 200:
-                    readme_text = readme_res.text
-                else:
-                    # Fallback branch master
-                    readme_res2 = await client.get(
-                        f"https://raw.githubusercontent.com/{username}/{name}/master/README.md"
-                    )
-                    if readme_res2.status_code == 200:
-                        readme_text = readme_res2.text
-            except Exception as exc:
-                logger.debug("Could not fetch README for %s: %s", name, exc)
-
-            readme_summary = ""
-            if readme_text and groq_api_key:
-                readme_summary = await summarize_readme_with_groq(
-                    repo_name=name,
-                    readme_text=readme_text,
-                    groq_api_key=groq_api_key,
-                )
-
-            repos_data.append({
+            for ref in dict.fromkeys([branch, "main", "master"]):
+                try:
+                    res = await client.get(f"https://raw.githubusercontent.com/{username}/{name}/{ref}/README.md")
+                except Exception as exc:
+                    logger.debug("README fetch failed for %s: %s", name, exc)
+                    continue
+                if res.status_code == 200:
+                    readme_text = res.text
+                    break
+            return {
                 "name": name,
-                "description": description,
-                "language": language,
-                "url": url,
-                "stars": stars,
-                "readme_summary": readme_summary,
-            })
+                "description": repo.get("description") or "",
+                "language": repo.get("language") or "Unknown",
+                "url": repo.get("html_url", ""),
+                "stars": repo.get("stargazers_count", 0),
+                "readme_summary": await summarize_readme_with_groq(name, readme_text),
+            }
 
-            if len(repos_data) >= MAX_REPOS_TO_FETCH:
-                break
+        repos_data = list(await asyncio.gather(*[_one(r) for r in originals]))
 
-    return json.dumps(repos_data, indent=2)
+    return repos_data

@@ -1,123 +1,158 @@
 """
-AnswerGenerator — single abstraction for form-question answering.
+AnswerGenerator — turns one form question into one answer.
 
-Phase 2 Design:
-- Decoupled from static profiles: receives live candidate context dict per call
-  (resume text, GitHub repos, LinkedIn, portfolio, structured facts).
-- Factual/identity fields (name, email, phone, URLs, college) are resolved
-  factually from structured candidate data or fast resume extractors.
-- Open-ended / paragraph fields leverage Groq to cross-reference the JD text
-  against candidate projects/experience, respecting the user's editable style template.
-- Human form-filling formatting: short paragraphs, bullet points, line breaks.
-- Discrete choice selection: handles radio, dropdown, and checkbox questions by
-  matching against the DOM's available choices.
-- Traces context sources used for each generated answer (doc 04 traceability).
+Order of attack for every question:
+1. Choice fields (radio / dropdown / checkbox): the model picks from the real options,
+   or says UNSURE. Sensitive questions are never guessed.
+2. Plain facts (name, phone, college, notice period...): copied from the candidate's
+   own facts. A missing fact is flagged for the user, never invented.
+3. Open-ended questions: written by the model from the resume, GitHub projects and
+   the role, then cleaned to read like a person wrote it.
+
+There is no placeholder/static fallback: if the profile cannot answer, the field is
+flagged and the user decides.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import date, timedelta
+from typing import TYPE_CHECKING, Optional
 
+from context.resume import regex_facts
+from context.store import get_facts
+from generator import llm
+from generator.humanize import clean_answer, limit_words, parse_limit
 from generator.prompts import build_choice_prompt, build_user_prompt, system_with_template
+
+if TYPE_CHECKING:
+    from intake.post import PostInfo
 
 logger = logging.getLogger(__name__)
 
-# Default Groq model — fast, high quality, active on Groq
-DEFAULT_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
-
-# Identity and factual field keys that are deterministically resolved
-_STATIC_ONLY_KEYS = {
-    "name", "email", "phone", "linkedin", "github",
-    "portfolio", "college", "degree", "graduation_year", "cgpa",
-}
-
 # ---------------------------------------------------------------------------
-# Keyword → profile-key mapping
-# Checked in order: specific questions before generic catch-alls.
+# Question -> fact routing
 # ---------------------------------------------------------------------------
-_FIELD_KEYWORDS: list[tuple[list[str], str]] = [
-    (["full name", "your name"],                                              "name"),
-    (["email address", "email id", "e-mail", "mail id"],                     "email"),
-    (["phone", "mobile", "contact number", "whatsapp"],                      "phone"),
-    (["linkedin"],                                                            "linkedin"),
-    (["github project", "github", "git hub"],                                "github"),
-    (["portfolio", "website", "personal site"],                              "portfolio"),
-    (["college", "university", "institution", "school"],                     "college"),
-    (["graduation", "year of graduation", "pass out", "batch"],              "graduation_year"),
-    (["cgpa", "gpa", "percentage", "grade"],                                 "cgpa"),
-    # Open-ended questions — checked BEFORE broad 'degree'/'course' keywords
-    (["why are you interested", "why do you want", "interested in this",
-      "motivation", "why this role", "why this company"],                    "why_interested"),
-    (["why should we hire", "why hire you", "why should we select",
-      "what makes you", "stand out"],                                        "why_hire"),
-    (["past experience", "relevant experience", "summarize your",
-      "experience including", "academic project", "internship", "coursework",
-      "course work"],                                                         "experience"),
-    (["describe", "tell us about", "introduce yourself",
-      "about yourself", "background"],                                        "about"),
-    # Education
-    (["degree", "major", "programme", "program",
-      " course ", "field of study"],                                         "degree"),
-    # Broad catch-alls — MUST be last
-    (["name"],                                                                "name"),
-    (["email"],                                                               "email"),
-    (["experience", "why"],                                                   "experience"),
+
+_FACT_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(p, re.IGNORECASE), key) for p, key in [
+        (r"\b(first name|given name)\b", "first_name"),
+        (r"\b(last name|surname|family name)\b", "last_name"),
+        (r"e-?mail", "email"),
+        (r"\b(phone|mobile|contact number|whatsapp|telephone)\b", "phone"),
+        (r"linkedin", "linkedin"),
+        (r"git ?hub", "github"),
+        (r"\b(portfolio|personal (web)?site|your website|website (url|link))\b", "portfolio"),
+        (r"\b(college|university|institution|institute)\b", "college"),
+        (r"\b(graduation|pass(ing)? ?out|year of passing|batch)\b", "graduation_year"),
+        (r"\b(cgpa|gpa|percentage)\b", "cgpa"),
+        (r"\b(degree|qualification|field of study)\b", "degree"),
+        (r"notice period|how soon can you join|joining (time|date)|earliest (start|joining)", "notice_period"),
+        (r"current (ctc|salary|compensation|package)", "current_ctc"),
+        (r"expected (ctc|salary|compensation|package)|salary expectation", "expected_ctc"),
+        (r"years of (work |professional )?experience|total experience", "years_experience"),
+        (r"current (company|employer|organi[sz]ation)", "current_company"),
+        (r"current (job )?(title|role|designation)", "current_title"),
+        (r"(current|present|preferred) location|where are you (based|located)|\bcity\b|\blocation\b", "location"),
+        (r"relocat", "relocate"),
+        (r"work authori[sz]ation|authori[sz]ed to work|\bvisa\b|sponsorship", "work_authorization"),
+        (r"^\W*(full |your |candidate'?s? |applicant'?s? )?name\W*$|\b(full name|your name|candidate name|applicant name)\b", "name"),
+    ]
 ]
 
+# Open questions that merely mention a fact word ("describe your GitHub projects").
+_OPEN_RE = re.compile(
+    r"\b(describe|explain|tell|why|how|walk|project|achievement|proud|challeng|strength|weakness|experience with)\b",
+    re.IGNORECASE,
+)
 
-def match_question_to_key(question: str) -> Optional[str]:
-    """
-    Return the profile-key whose keywords appear in the question text.
-    Returns None if no match.
-    """
-    q = question.lower()
-    for keywords, key in _FIELD_KEYWORDS:
-        if any(kw in q for kw in keywords):
+# Questions the bot must never answer on its own.
+_SENSITIVE_RE = re.compile(
+    r"\b(gender|sex|ethnic\w*|race|racial|veteran|disabilit\w*|religio\w*|caste|marital|pronoun\w*|"
+    r"date of birth|dob|sexual orientation|criminal|convict\w*)\b",
+    re.IGNORECASE,
+)
+_DECLINE_RE = re.compile(
+    r"prefer not|decline|do not wish|don'?t wish|rather not|not to (say|disclose)|choose not", re.IGNORECASE
+)
+
+# Refusals are only legitimate for questions like these; anything else gets one retry.
+_PERSONAL_FACT_RE = re.compile(
+    r"salary|ctc|compensation|package|notice|visa|sponsor|authori[sz]|date of birth|dob|reference|"
+    r"passport|aadhaar|\bpan\b|\bssn\b|expected|current pay",
+    re.IGNORECASE,
+)
+
+_FACT_HINT = {
+    "notice_period": "/fact notice_period 30 days",
+    "current_ctc": "/fact current_ctc 12 LPA",
+    "expected_ctc": "/fact expected_ctc 18 LPA",
+    "years_experience": "/fact years_experience 2",
+    "work_authorization": "/fact work_authorization Authorized to work in India",
+    "relocate": "/fact relocate Yes",
+    "location": "/fact location Bengaluru",
+    "current_company": "/fact current_company <company>",
+    "current_title": "/fact current_title <title>",
+}
+
+
+def match_fact_key(question: str, field_type: str) -> Optional[str]:
+    """Which candidate fact does this question ask for, if any?"""
+    if field_type != "short_text":
+        return None
+    q = re.sub(r"[*:]+", " ", question).strip()
+    if len(q.split()) > 18 or _OPEN_RE.search(q):
+        return None
+    for pattern, key in _FACT_RULES:
+        if pattern.search(q):
             return key
     return None
+
+
+def join_date(notice: str, today: Optional[date] = None) -> Optional[date]:
+    """'30 days', '2 months', 'immediate' -> a calendar date. None if it can't be read."""
+    today = today or date.today()
+    n = notice.lower()
+    if re.search(r"immediate|asap|right away|now", n):
+        return today
+    m = re.search(r"(\d+)\s*(day|week|month)", n)
+    if not m:
+        return None
+    qty, unit = int(m.group(1)), m.group(2)
+    return today + timedelta(days=qty * {"day": 1, "week": 7, "month": 30}[unit])
 
 
 @dataclass
 class AnswerResult:
     """
-    The output of a single generate() call.
-
-    value            : The answer string, or None if the field must be filled manually.
-    source           : "context_store" | "groq" | "static_fallback" | "manual_required"
-    context_keys_used: Which context keys/slices were used (doc 04 traceability).
-    flagged          : True = shown with a ❓ icon in preview.
-    confidence       : 0–1.
+    value             : answer text, or None when the user must fill it in.
+    source            : "profile" | "llm" | "manual_required"
+    context_keys_used : what the answer drew from (shown in the preview).
+    flagged           : True = shown with a warning in the preview.
+    note              : short hint for the user (e.g. how to add a missing fact).
     """
     value: Optional[str]
     source: str
     context_keys_used: list[str] = field(default_factory=list)
     flagged: bool = False
     confidence: float = 1.0
+    note: str = ""
+
+
+def _manual(note: str = "") -> AnswerResult:
+    return AnswerResult(value=None, source="manual_required", flagged=True, confidence=0.0, note=note)
 
 
 class AnswerGenerator:
-    """
-    Core answer generation engine.
-    """
+    def __init__(self, groq_api_key: Optional[str] = None, model: Optional[str] = None,
+                 fallback_profile: Optional[dict[str, str]] = None) -> None:
+        # Arguments kept for backward compatibility. The key and model are read from the
+        # environment at call time (generator/llm.py); fallback_profile is no longer used.
+        self._sem = asyncio.Semaphore(4)  # parallel questions, gentle on Groq rate limits
 
-    def __init__(
-        self,
-        groq_api_key: Optional[str] = None,
-        model: str = DEFAULT_MODEL,
-        fallback_profile: Optional[dict[str, str]] = None,
-    ) -> None:
-        self._groq_api_key = groq_api_key
-        self._model = model
-        self._fallback_profile = fallback_profile or {}
-        self._groq_client = None
-
-        if groq_api_key:
-            logger.info("AnswerGenerator initialized with Groq model: %s", model)
-        else:
-            logger.info("AnswerGenerator initialized without Groq (static mode).")
+    # -----------------------------------------------------------------------
 
     async def generate(
         self,
@@ -127,321 +162,158 @@ class AnswerGenerator:
         context: Optional[dict[str, str]] = None,
         user_template: Optional[str] = None,
         choices: Optional[list[str]] = None,
+        post: Optional["PostInfo"] = None,
     ) -> AnswerResult:
-        """
-        Generate a candidate answer for a form field.
-
-        Args:
-            question: Form question string
-            field_type: "short_text" | "paragraph" | "radio" | "checkbox" | "dropdown"
-            jd_text: Full job description text
-            context: Candidate context dict from context_versions (resume, github, etc.)
-            user_template: Candidate's custom tone/style instructions
-            choices: List of available option strings for radio/dropdown/checkbox
-
-        Returns:
-            AnswerResult with answer text, source, and context traceability tags.
-        """
         ctx = context or {}
-        profile_key = match_question_to_key(question)
+        facts = self._facts(ctx)
 
-        # -------------------------------------------------------------------
-        # 1. Discrete Choice Selection (Radio, Dropdown, Checkbox)
-        # -------------------------------------------------------------------
-        if choices and (field_type in ("radio", "dropdown", "checkbox") or len(choices) > 0):
-            if self._groq_api_key:
-                try:
-                    return await self._groq_choice(
-                        question=question,
-                        field_type=field_type,
-                        choices=choices,
-                        jd_text=jd_text,
-                        context=ctx,
-                    )
-                except Exception as exc:
-                    logger.warning("Groq choice selection failed for %r: %s", question, exc)
+        if choices:
+            return await self._choose(question, field_type, choices, jd_text, ctx, facts, post)
 
-            # Fallback choice selection
-            matched = self._fallback_choice_match(question, choices, ctx)
+        if field_type == "date":
+            return self._date_answer(question, facts)
+
+        key = match_fact_key(question, field_type)
+        if key:
+            value = self._fact_value(key, facts)
+            if value:
+                return AnswerResult(value=value, source="profile", context_keys_used=[f"fact:{key}"])
+            return _manual(f"Not in your profile. Add it with {_FACT_HINT.get(key, f'/fact {key} <value>')}")
+
+        return await self._open_answer(question, field_type, jd_text, ctx, facts, user_template, post)
+
+    # -----------------------------------------------------------------------
+    # Dates
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _date_answer(question: str, facts: dict[str, str]) -> AnswerResult:
+        """Join-date questions are answered from the notice-period fact; everything else is the user's call."""
+        if re.search(r"join|joining|start|available|availability|notice", question, re.IGNORECASE):
+            when = join_date(facts.get("notice_period", ""))
+            if when:
+                return AnswerResult(value=when.isoformat(), source="profile", context_keys_used=["fact:notice_period"])
+            return _manual("Add your notice period with /fact notice_period 30 days, or set the date with /edit N YYYY-MM-DD")
+        return _manual("Date field. Set it with /edit N YYYY-MM-DD")
+
+    # -----------------------------------------------------------------------
+    # Facts
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _facts(ctx: dict[str, str]) -> dict[str, str]:
+        facts = get_facts(ctx)
+        # Identifiers found in the resume text fill any gap (never the pasted LinkedIn blob).
+        for k, v in regex_facts(ctx.get("resume", "")).items():
+            facts.setdefault(k, v)
+        return facts
+
+    @staticmethod
+    def _fact_value(key: str, facts: dict[str, str]) -> Optional[str]:
+        if key in ("first_name", "last_name"):
+            parts = facts.get("name", "").split()
+            if not parts:
+                return None
+            return parts[0] if key == "first_name" else (" ".join(parts[1:]) or None)
+        return facts.get(key) or None
+
+    # -----------------------------------------------------------------------
+    # Choice fields
+    # -----------------------------------------------------------------------
+
+    async def _choose(self, question, field_type, choices, jd_text, ctx, facts, post) -> AnswerResult:
+        if _SENSITIVE_RE.search(question):
+            decline = next((c for c in choices if _DECLINE_RE.search(c)), None)
+            if decline:
+                return AnswerResult(
+                    value=decline, source="profile", flagged=True,
+                    context_keys_used=["rule:sensitive_question"],
+                    note="Personal question, so I picked the opt-out answer. Change it with /edit if you prefer.",
+                )
+            return _manual("Personal question. I don't answer these for you.")
+
+        if not llm.has_llm():
+            return _manual("No AI key configured, so I can't pick an option.")
+
+        prompt = build_choice_prompt(question, field_type, choices, jd_text, ctx, facts, post)
+        try:
+            async with self._sem:
+                raw = await llm.chat(
+                    [{"role": "system", "content": "You answer application-form questions about a candidate strictly from their profile."},
+                     {"role": "user", "content": prompt}],
+                    temperature=0.0, max_tokens=120,
+                )
+        except Exception as exc:
+            logger.warning("Choice selection failed for %r: %s", question, exc)
+            return _manual("The AI call failed. Pick this one yourself.")
+
+        raw = raw.strip().strip("\"'").strip()
+        logger.info("Choice for %r -> %r", question, raw)
+        if not raw or raw.upper().startswith("UNSURE"):
+            return _manual("Your profile doesn't say. Pick this one yourself.")
+
+        if field_type == "checkbox":
+            wanted = [p.strip().lower() for p in raw.split("|") if p.strip()]
+            matched = [c for c in choices if any(w == c.lower() or w in c.lower() for w in wanted)]
             if matched:
-                return AnswerResult(
-                    value=matched,
-                    source="static_fallback",
-                    context_keys_used=["fallback:choice_heuristic"],
-                    flagged=False,
-                )
-            return AnswerResult(
-                value=None,
-                source="manual_required",
-                context_keys_used=[],
-                flagged=True,
-            )
-
-        # -------------------------------------------------------------------
-        # 2. Deterministic/Factual fields (name, email, phone, urls, education)
-        # -------------------------------------------------------------------
-        if profile_key in _STATIC_ONLY_KEYS and profile_key != "github":
-            direct_val = self._resolve_factual_field(profile_key, ctx)
-            if direct_val:
-                return AnswerResult(
-                    value=direct_val,
-                    source="context_store",
-                    context_keys_used=[f"context:{profile_key}"],
-                    flagged=False,
-                )
-
-        # -------------------------------------------------------------------
-        # 3. For GitHub project listings / links question
-        # -------------------------------------------------------------------
-        if profile_key == "github" and "github" in ctx and ctx["github"]:
-            if "top" in question.lower() or "list" in question.lower() or "project" in question.lower():
-                if self._groq_api_key:
-                    return await self._groq_answer(question, field_type, jd_text, ctx, user_template)
-                else:
-                    return AnswerResult(
-                        value=ctx["github"],
-                        source="context_store",
-                        context_keys_used=["context:github"],
-                        flagged=False,
-                    )
-            else:
-                github_url = self._resolve_factual_field("github", ctx)
-                if github_url:
-                    return AnswerResult(
-                        value=github_url,
-                        source="context_store",
-                        context_keys_used=["context:github_url"],
-                        flagged=False,
-                    )
-
-        # -------------------------------------------------------------------
-        # 4. Open-ended / Paragraph fields with Groq available
-        # -------------------------------------------------------------------
-        if self._groq_api_key and (field_type == "paragraph" or profile_key not in _STATIC_ONLY_KEYS):
-            try:
-                return await self._groq_answer(
-                    question=question,
-                    field_type=field_type,
-                    jd_text=jd_text,
-                    context=ctx,
-                    user_template=user_template,
-                )
-            except Exception as exc:
-                logger.warning("Groq generation failed for %r, falling back to static: %s", question, exc)
-
-        # -------------------------------------------------------------------
-        # 5. Fallback matching against context or fallback profile
-        # -------------------------------------------------------------------
-        fallback_val = self._resolve_factual_field(profile_key, ctx) if profile_key else None
-        if fallback_val:
-            return AnswerResult(
-                value=fallback_val,
-                source="context_store" if profile_key in ctx else "static_fallback",
-                context_keys_used=[f"fallback:{profile_key}"],
-                flagged=False,
-            )
-
-        # -------------------------------------------------------------------
-        # 6. Flag for manual review if no answer could be grounded
-        # -------------------------------------------------------------------
-        return AnswerResult(
-            value=None,
-            source="manual_required",
-            context_keys_used=[],
-            flagged=True,
-        )
-
-    def _resolve_factual_field(self, key: Optional[str], context: dict[str, str]) -> Optional[str]:
-        """
-        Attempt to resolve a factual property from context dict or fallback profile.
-        """
-        if not key:
-            return None
-
-        # Direct key in context
-        if key in context and context[key]:
-            return context[key]
-
-        # Check resume text with quick heuristics
-        if "resume" in context and context["resume"]:
-            resume_text = context["resume"]
-            if key == "email":
-                m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", resume_text)
-                if m:
-                    return m.group(0)
-            elif key == "phone":
-                m = re.search(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", resume_text)
-                if m:
-                    return m.group(0)
-            elif key == "linkedin":
-                m = re.search(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w-]+", resume_text, re.IGNORECASE)
-                if m:
-                    return m.group(0)
-            elif key == "github":
-                m = re.search(r"(?:https?://)?(?:www\.)?github\.com/[\w-]+", resume_text, re.IGNORECASE)
-                if m:
-                    return m.group(0)
-
-        # Fallback profile (e.g. STATIC_PROFILE placeholder)
-        if key in self._fallback_profile and self._fallback_profile[key]:
-            return self._fallback_profile[key]
-
-        return None
-
-    def _fallback_choice_match(
-        self, question: str, choices: list[str], context: dict[str, str]
-    ) -> Optional[str]:
-        """
-        Simple heuristic choice matching when Groq is unavailable.
-        """
-        q_lower = question.lower()
-        # For yes/no questions
-        if any(c.lower() in ("yes", "no") for c in choices):
-            # If candidate has background, default to Yes for positive experience queries
+                return AnswerResult(" | ".join(matched), "llm", ["llm:choice"])
+        else:
+            low = raw.lower()
             for c in choices:
-                if c.strip().lower() == "yes":
-                    return c
+                if c.strip().lower() == low:
+                    return AnswerResult(c, "llm", ["llm:choice"])
+            for c in choices:
+                if c.strip().lower() in low or low in c.strip().lower():
+                    return AnswerResult(c, "llm", ["llm:choice"])
 
-        return choices[0] if choices else None
+        logger.warning("Could not match %r to options %r", raw, choices)
+        return _manual("I couldn't match an option confidently. Pick this one yourself.")
 
-    async def _groq_choice(
-        self,
-        question: str,
-        field_type: str,
-        choices: list[str],
-        jd_text: str,
-        context: dict[str, str],
-    ) -> AnswerResult:
-        """
-        Select the best option from available choices using Groq.
-        """
-        from groq import AsyncGroq
+    # -----------------------------------------------------------------------
+    # Open-ended
+    # -----------------------------------------------------------------------
 
-        if self._groq_client is None:
-            self._groq_client = AsyncGroq(api_key=self._groq_api_key)
+    async def _open_answer(self, question, field_type, jd_text, ctx, facts, user_template, post) -> AnswerResult:
+        if not llm.has_llm():
+            return _manual("No AI key configured.")
+        if not (ctx.get("resume") or ctx.get("linkedin") or ctx.get("github") or facts):
+            return _manual("I have no profile yet. Send /upload first.")
 
-        prompt = build_choice_prompt(
-            question=question,
-            field_type=field_type,
-            choices=choices,
-            jd_text=jd_text,
-            context=context,
-        )
+        max_chars, max_words = parse_limit(question)
+        prompt = build_user_prompt(question, field_type, jd_text, ctx, facts, post, max_chars, max_words)
+        tokens = 700 if field_type == "paragraph" else 200
+        if max_words:
+            tokens = min(tokens, max_words * 3 + 40)
 
-        response = await self._groq_client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": "You are a precise job application assistant. You strictly pick matching options from provided lists."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=60,
-        )
-
-        raw = response.choices[0].message.content.strip().strip('"').strip("'")
-        logger.info("Groq choice raw output for %r: %r", question, raw)
-
-        # For checkbox (multi-select)
-        if field_type == "checkbox" and "|" in raw:
-            selected_items = [p.strip() for p in raw.split("|") if p.strip()]
-            matched = []
-            for item in selected_items:
-                for c in choices:
-                    if c.lower() == item.lower() or item.lower() in c.lower():
-                        if c not in matched:
-                            matched.append(c)
-            if matched:
-                return AnswerResult(
-                    value=" | ".join(matched),
-                    source="groq",
-                    context_keys_used=["groq:choice_select"],
-                    flagged=False,
-                )
-
-        # For single-select (radio, dropdown): exact or case-insensitive match
-        for c in choices:
-            if c.strip().lower() == raw.lower():
-                return AnswerResult(
-                    value=c,
-                    source="groq",
-                    context_keys_used=["groq:choice_select"],
-                    flagged=False,
-                )
-
-        # Partial substring match if exact match missed
-        for c in choices:
-            if c.lower() in raw.lower() or raw.lower() in c.lower():
-                return AnswerResult(
-                    value=c,
-                    source="groq",
-                    context_keys_used=["groq:choice_select"],
-                    flagged=False,
-                )
-
-        # Fallback to first choice if no match
-        logger.warning("Could not exact-match Groq output %r to choices %r", raw, choices)
-        return AnswerResult(
-            value=choices[0],
-            source="groq",
-            context_keys_used=["groq:choice_select"],
-            flagged=False,
-        )
-
-    async def _groq_answer(
-        self,
-        question: str,
-        field_type: str,
-        jd_text: str,
-        context: dict[str, str],
-        user_template: Optional[str],
-    ) -> AnswerResult:
-        """
-        Call Groq API with grounded prompt, human-like structure, and traceability tags.
-        """
-        from groq import AsyncGroq
-
-        if self._groq_client is None:
-            self._groq_client = AsyncGroq(api_key=self._groq_api_key)
-
-        system = system_with_template(user_template)
-        user_prompt = build_user_prompt(
-            question=question,
-            field_type=field_type,
-            jd_text=jd_text,
-            context=context,
-        )
-
-        max_tokens = 500 if field_type == "paragraph" else 120
-
-        response = await self._groq_client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=max_tokens,
-        )
-
-        raw = response.choices[0].message.content.strip()
+        messages = [{"role": "system", "content": system_with_template(user_template)},
+                    {"role": "user", "content": prompt}]
+        try:
+            async with self._sem:
+                raw = await llm.chat(messages, temperature=0.4, max_tokens=tokens)
+                if "NEEDS_MANUAL_REVIEW" in raw and not _PERSONAL_FACT_RE.search(question):
+                    logger.info("Model refused %r; retrying once", question)
+                    messages += [
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": (
+                            "This question is about the candidate's work and background, so it can be answered "
+                            "from the profile. Write the answer now. Use only facts in the profile and leave out "
+                            "anything it does not cover. Do not reply NEEDS_MANUAL_REVIEW.")},
+                    ]
+                    raw = await llm.chat(messages, temperature=0.4, max_tokens=tokens)
+        except Exception as exc:
+            logger.warning("Answer generation failed for %r: %s", question, exc)
+            return _manual("The AI call failed. Answer this one yourself.")
 
         if "NEEDS_MANUAL_REVIEW" in raw:
-            logger.info("Groq flagged question for manual review: %r", question)
-            return AnswerResult(
-                value=None,
-                source="manual_required",
-                context_keys_used=[],
-                flagged=True,
-            )
+            return _manual("Your profile has nothing that honestly answers this. Write it yourself.")
 
-        # Trace context sources present in context dict
-        sources_used = [f"context:{k}" for k in ("resume", "github", "linkedin", "portfolio") if k in context and context[k]]
-        if not sources_used:
-            sources_used = ["groq:jd_crossref"]
+        text = clean_answer(raw, field_type, max_chars)
+        if max_words:
+            text = limit_words(text, max_words)
+        if not text:
+            return _manual("The AI returned an empty answer.")
 
-        return AnswerResult(
-            value=raw,
-            source="groq",
-            context_keys_used=sources_used,
-            flagged=False,
-        )
+        used = [f"context:{k}" for k in ("resume", "github", "linkedin", "portfolio") if ctx.get(k)]
+        if post and (post.role or post.requirements):
+            used.append("post:role")
+        return AnswerResult(value=text, source="llm", context_keys_used=used or ["llm:general"])
